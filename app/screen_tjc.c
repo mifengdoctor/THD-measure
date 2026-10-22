@@ -1,0 +1,365 @@
+#include "screen_tjc.h"
+
+#include "adc_capture.h"
+#include "app_config.h"
+#include "bsp_uart_tjc.h"
+
+/*
+ * sWave:
+ * id = 5
+ * ch 属性 = 1，表示控件只有 1 个通道。
+ * 命令中的通道编号从 0 开始，因此必须使用通道 0。
+ */
+#define SCREEN_WAVE_ID_STR          "5"
+#define SCREEN_WAVE_CHANNEL_STR     "0"
+
+#define SCREEN_WAVE_HEIGHT          (125U)
+#define SCREEN_WAVE_VALUE_MAX       (SCREEN_WAVE_HEIGHT - 1U)
+
+/* ---------- 临时算法诊断变量 ---------- */
+extern volatile uint8_t g_thd_debug_stage;
+extern volatile uint16_t g_thd_debug_edge_count;
+extern volatile float g_thd_debug_period_samples;
+extern volatile float g_thd_debug_frequency_hz;
+extern volatile float g_thd_debug_amplitude0;
+/* -------------------------------------- */
+
+static void screen_send_marker(void)
+{
+    BSP_UART_TJC_SendByte(0xFFU);
+    BSP_UART_TJC_SendByte(0xFFU);
+    BSP_UART_TJC_SendByte(0xFFU);
+}
+
+static void screen_send_uint(uint32_t value)
+{
+    char buffer[10];
+    uint8_t index = 0U;
+    uint8_t out;
+
+    if (value == 0U) {
+        BSP_UART_TJC_SendByte((uint8_t)'0');
+        return;
+    }
+
+    while ((value > 0U) &&
+           (index < sizeof(buffer))) {
+
+        buffer[index] =
+            (char)('0' + (value % 10U));
+
+        value /= 10U;
+        index++;
+    }
+
+    for (out = index; out > 0U; out--) {
+        BSP_UART_TJC_SendByte(
+            (uint8_t)buffer[out - 1U]);
+    }
+}
+
+static uint32_t screen_scale_wave_value(uint8_t value)
+{
+    return ((uint32_t)value * SCREEN_WAVE_VALUE_MAX + 127U) / 255U;
+}
+
+static void screen_send_fixed(
+    const char *name,
+    uint32_t scaled_value,
+    uint8_t decimal_count)
+{
+    uint32_t divisor = 1U;
+    uint32_t integer_part;
+    uint32_t fraction_part;
+    uint8_t i;
+
+    for (i = 0U; i < decimal_count; i++) {
+        divisor *= 10U;
+    }
+
+    BSP_UART_TJC_SendString(name);
+    BSP_UART_TJC_SendString(".txt=\"");
+
+    integer_part = scaled_value / divisor;
+    fraction_part = scaled_value % divisor;
+
+    screen_send_uint(integer_part);
+
+    if (decimal_count > 0U) {
+        BSP_UART_TJC_SendByte((uint8_t)'.');
+
+        divisor /= 10U;
+
+        while (divisor > 0U) {
+            BSP_UART_TJC_SendByte(
+                (uint8_t)(
+                    '0' +
+                    (fraction_part / divisor) % 10U));
+
+            divisor /= 10U;
+        }
+    }
+
+    BSP_UART_TJC_SendByte((uint8_t)'"');
+    screen_send_marker();
+}
+
+static void screen_send_frequency(
+    const char *name,
+    float value)
+{
+    uint32_t integer_value;
+
+    if (value < 0.0f) {
+        value = 0.0f;
+    }
+
+    integer_value =
+        (uint32_t)(value + 0.5f);
+
+    BSP_UART_TJC_SendString(name);
+    BSP_UART_TJC_SendString(".txt=\"");
+
+    screen_send_uint(integer_value);
+
+    BSP_UART_TJC_SendByte((uint8_t)'"');
+    screen_send_marker();
+}
+
+static void screen_send_text(
+    const char *name,
+    const char *value)
+{
+    BSP_UART_TJC_SendString(name);
+    BSP_UART_TJC_SendString(".txt=\"");
+
+    BSP_UART_TJC_SendString(value);
+
+    BSP_UART_TJC_SendByte((uint8_t)'"');
+    screen_send_marker();
+}
+
+static void screen_clear_waveform(void)
+{
+    BSP_UART_TJC_SendString(
+        "cle " SCREEN_WAVE_ID_STR "," SCREEN_WAVE_CHANNEL_STR);
+
+    screen_send_marker();
+}
+
+static void screen_send_raw_wave(
+    const uint16_t *samples,
+    uint16_t sample_count,
+    uint16_t min_value,
+    uint16_t max_value)
+{
+    uint16_t i;
+    uint16_t center;
+    uint16_t half_span;
+    uint32_t index;
+
+    int32_t centered;
+    int32_t scaled;
+
+    if ((samples == 0) ||
+        (sample_count < 2U) ||
+        (max_value <= min_value)) {
+
+        return;
+    }
+
+    center = (uint16_t)(
+        ((uint32_t)min_value +
+         (uint32_t)max_value) / 2U);
+
+    half_span = (uint16_t)(
+        ((uint32_t)max_value -
+         (uint32_t)min_value) / 2U);
+
+    if (half_span == 0U) {
+        return;
+    }
+
+    screen_clear_waveform();
+
+    for (i = 0U; i < WAVE_POINT_COUNT; i++) {
+        index =
+            ((uint32_t)i *
+             (uint32_t)(sample_count - 1U)) /
+            (uint32_t)(WAVE_POINT_COUNT - 1U);
+
+        centered =
+            (int32_t)samples[index] -
+            (int32_t)center;
+
+        scaled =
+            128 + (centered * 100) /
+            (int32_t)half_span;
+
+        if (scaled < 0) {
+            scaled = 0;
+        } else if (scaled > 255) {
+            scaled = 255;
+        }
+
+        BSP_UART_TJC_SendString(
+            "add " SCREEN_WAVE_ID_STR "," 
+            SCREEN_WAVE_CHANNEL_STR ",");
+
+        screen_send_uint(
+            screen_scale_wave_value((uint8_t)scaled));
+        screen_send_marker();
+    }
+}
+
+void Screen_TJC_Init(void)
+{
+    Screen_TJC_SetStatus("READY");
+
+    screen_clear_waveform();
+}
+
+void Screen_TJC_SetStatus(const char *status)
+{
+    screen_send_text("tStatus", status);
+}
+
+void Screen_TJC_SendNoSignal(void)
+{
+    Screen_TJC_SetStatus("NO SIGNAL");
+
+    screen_send_frequency("tFreq", 0.0f);
+
+    screen_send_fixed("tTHD", 0U, 2U);
+
+    screen_send_fixed("tH1", 0U, 3U);
+    screen_send_fixed("tH2", 0U, 3U);
+    screen_send_fixed("tH3", 0U, 3U);
+    screen_send_fixed("tH4", 0U, 3U);
+    screen_send_fixed("tH5", 0U, 3U);
+
+    screen_clear_waveform();
+}
+
+void Screen_TJC_SendAdcDebug(
+    uint16_t min_value,
+    uint16_t max_value)
+{
+    Screen_TJC_SetStatus("ALGO FAIL");
+
+    screen_send_frequency(
+        "tFreq",
+        g_thd_debug_frequency_hz);
+
+    screen_send_fixed(
+        "tTHD",
+        (uint32_t)g_thd_debug_stage,
+        0U);
+
+    screen_send_fixed(
+        "tH1",
+        (uint32_t)(
+            g_thd_debug_period_samples *
+            100.0f + 0.5f),
+        2U);
+
+    screen_send_fixed(
+        "tH2",
+        (uint32_t)g_thd_debug_edge_count,
+        0U);
+
+    screen_send_fixed(
+        "tH3",
+        (uint32_t)(
+            g_thd_debug_amplitude0 *
+            1000.0f + 0.5f),
+        3U);
+
+    screen_send_fixed(
+        "tH4",
+        (uint32_t)min_value,
+        0U);
+
+    screen_send_fixed(
+        "tH5",
+        (uint32_t)max_value,
+        0U);
+
+    screen_send_raw_wave(
+        ADC_Capture_GetSamples(),
+        ADC_CAPTURE_SAMPLES,
+        min_value,
+        max_value);
+}
+
+void Screen_TJC_SendMeasurement(
+    const MeasurementResult *result,
+    const uint8_t *wave_points,
+    uint16_t point_count)
+{
+    uint16_t i;
+
+    if ((result == 0) ||
+        (!result->valid)) {
+
+        Screen_TJC_SendNoSignal();
+        return;
+    }
+
+    screen_send_frequency(
+        "tFreq",
+        result->frequency_hz);
+
+    screen_send_fixed(
+        "tTHD",
+        (uint32_t)(
+            (result->thd_percent * 100.0f) + 0.5f),
+        2U);
+
+    screen_send_fixed(
+        "tH1",
+        (uint32_t)(
+            (result->harmonic[0] * 1000.0f) + 0.5f),
+        3U);
+
+    screen_send_fixed(
+        "tH2",
+        (uint32_t)(
+            (result->harmonic[1] * 1000.0f) + 0.5f),
+        3U);
+
+    screen_send_fixed(
+        "tH3",
+        (uint32_t)(
+            (result->harmonic[2] * 1000.0f) + 0.5f),
+        3U);
+
+    screen_send_fixed(
+        "tH4",
+        (uint32_t)(
+            (result->harmonic[3] * 1000.0f) + 0.5f),
+        3U);
+
+    screen_send_fixed(
+        "tH5",
+        (uint32_t)(
+            (result->harmonic[4] * 1000.0f) + 0.5f),
+        3U);
+
+    if ((wave_points != 0) &&
+        (point_count > 0U)) {
+
+        screen_clear_waveform();
+
+        for (i = 0U; i < point_count; i++) {
+            BSP_UART_TJC_SendString(
+                "add " SCREEN_WAVE_ID_STR "," 
+                SCREEN_WAVE_CHANNEL_STR ",");
+
+            screen_send_uint(
+                screen_scale_wave_value(wave_points[i]));
+
+            screen_send_marker();
+        }
+    }
+}
