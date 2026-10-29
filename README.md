@@ -1,5 +1,5 @@
 ## Example Summary
-电压电流表
+2021年电赛a题 信号失真度测量装置
 Empty project using DriverLib.
 This example shows a basic empty project using DriverLib with just main file
 and SysConfig initialization.
